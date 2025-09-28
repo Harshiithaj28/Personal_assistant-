@@ -2,11 +2,9 @@ import logging
 from livekit.agents import function_tool, RunContext
 import requests
 from langchain_community.tools import DuckDuckGoSearchRun
-import os
-import smtplib
-from email.mime.multipart import MIMEMultipart  
-from email.mime.text import MIMEText
-from typing import Optional
+import json
+from datetime import datetime, date, timedelta
+from pathlib import Path
 
 @function_tool()
 async def get_weather(
@@ -41,72 +39,195 @@ async def search_web(
         return results
     except Exception as e:
         logging.error(f"Error searching the web for '{query}': {e}")
-        return f"An error occurred while searching the web for '{query}'."    
+        return f"An error occurred while searching the web for '{query}'."
 
-@function_tool()    
-async def send_email(
+
+# ==========================
+# Medicine Checklist Tools
+# ==========================
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_FILE = DATA_DIR / "medicines.json"
+
+def _load_db() -> dict:
+    try:
+        if not DATA_FILE.exists():
+            return {"medicines": []}
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"medicines": []}
+
+def _save_db(db: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with DATA_FILE.open("w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+
+def _normalize_time_str(t: str) -> str:
+    t = t.strip().lower()
+    fmts = ["%H:%M", "%I:%M %p", "%I %p"]
+    for fmt in fmts:
+        try:
+            d = datetime.strptime(t, fmt)
+            return d.strftime("%H:%M")
+        except ValueError:
+            continue
+    if t.isdigit():
+        h = int(t)
+        if 0 <= h <= 23:
+            return f"{h:02d}:00"
+    raise ValueError(f"Invalid time format: {t}")
+
+def _today_str() -> str:
+    return date.today().isoformat()
+
+@function_tool()
+async def add_medicine(
     context: RunContext,  # type: ignore
-    to_email: str,
-    subject: str,
-    message: str,
-    cc_email: Optional[str] = None
+    name: str,
+    times: str,
+    dosage: str = "",
+    notes: str = "",
 ) -> str:
     """
-    Send an email through Gmail.
-    
-    Args:
-        to_email: Recipient email address
-        subject: Email subject line
-        message: Email body content
-        cc_email: Optional CC email address
+    Add or update a medicine with one or more times per day.
+    - name: Medicine name (e.g., "Metformin")
+    - times: Comma-separated times like "8 am, 20:30" or "08:00, 14:00"
+    - dosage: Optional dosage text (e.g., "500 mg")
+    - notes: Optional notes (e.g., "after food")
     """
     try:
-        # Gmail SMTP configuration
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        
-        # Get credentials from environment variables
-        gmail_user = os.getenv("GMAIL_USER")
-        gmail_password = os.getenv("GMAIL_APP_PASSWORD")  # Use App Password, not regular password
-        
-        if not gmail_user or not gmail_password:
-            logging.error("Gmail credentials not found in environment variables")
-            return "Email sending failed: Gmail credentials not configured."
-        
-        # Create message
-        msg = MIMEMultipart()
-        msg['From'] = gmail_user
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        
-        # Add CC if provided
-        recipients = [to_email]
-        if cc_email:
-            msg['Cc'] = cc_email
-            recipients.append(cc_email)
-        
-        # Attach message body
-        msg.attach(MIMEText(message, 'plain'))
-        
-        # Connect to Gmail SMTP server
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()  # Enable TLS encryption
-        server.login(gmail_user, gmail_password)
-        
-        # Send email
-        text = msg.as_string()
-        server.sendmail(gmail_user, recipients, text)
-        server.quit()
-        
-        logging.info(f"Email sent successfully to {to_email}")
-        return f"Email sent successfully to {to_email}"
-        
-    except smtplib.SMTPAuthenticationError:
-        logging.error("Gmail authentication failed")
-        return "Email sending failed: Authentication error. Please check your Gmail credentials."
-    except smtplib.SMTPException as e:
-        logging.error(f"SMTP error occurred: {e}")
-        return f"Email sending failed: SMTP error - {str(e)}"
+        parsed_times = []
+        for t in times.split(','):
+            if t.strip():
+                parsed_times.append(_normalize_time_str(t))
+        parsed_times = sorted(set(parsed_times))
+        if not parsed_times:
+            return "No valid times provided."
+
+        db = _load_db()
+        meds = db.get("medicines", [])
+        existing = next((m for m in meds if m["name"].lower() == name.lower()), None)
+        if existing:
+            existing["times"] = parsed_times
+            existing["dosage"] = dosage
+            existing["notes"] = notes
+        else:
+            meds.append({
+                "name": name,
+                "times": parsed_times,
+                "dosage": dosage,
+                "notes": notes,
+                "taken_log": {},
+            })
+        db["medicines"] = meds
+        _save_db(db)
+        return f"Added/updated medicine '{name}' at {', '.join(parsed_times)}."
+    except ValueError as ve:
+        return str(ve)
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
-        return f"An error occurred while sending email: {str(e)}"
+        logging.error(f"add_medicine error: {e}")
+        return "Failed to add medicine due to an internal error."
+
+@function_tool()
+async def list_medicines(
+    context: RunContext,  # type: ignore
+) -> str:
+    """
+    List all medicines with times, dosage, and notes.
+    """
+    db = _load_db()
+    meds = db.get("medicines", [])
+    if not meds:
+        return "No medicines found."
+    lines = []
+    for m in meds:
+        line = f"- {m['name']}: times {', '.join(m['times'])}"
+        if m.get("dosage"):
+            line += f", dosage {m['dosage']}"
+        if m.get("notes"):
+            line += f", notes {m['notes']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+@function_tool()
+async def remove_medicine(
+    context: RunContext,  # type: ignore
+    name: str,
+) -> str:
+    """
+    Remove a medicine by name.
+    """
+    db = _load_db()
+    meds = db.get("medicines", [])
+    new_meds = [m for m in meds if m["name"].lower() != name.lower()]
+    if len(new_meds) == len(meds):
+        return f"Medicine '{name}' not found."
+    db["medicines"] = new_meds
+    _save_db(db)
+    return f"Removed medicine '{name}'."
+
+@function_tool()
+async def mark_medicine_taken(
+    context: RunContext,  # type: ignore
+    name: str,
+) -> str:
+    """
+    Mark a medicine as taken for today (records timestamp).
+    """
+    db = _load_db()
+    meds = db.get("medicines", [])
+    m = next((m for m in meds if m["name"].lower() == name.lower()), None)
+    if not m:
+        return f"Medicine '{name}' not found."
+    today = _today_str()
+    now_str = datetime.now().strftime("%H:%M")
+    taken_log = m.get("taken_log", {})
+    taken_today = taken_log.get(today, [])
+    taken_today.append(now_str)
+    taken_log[today] = taken_today
+    m["taken_log"] = taken_log
+    _save_db(db)
+    return f"Marked '{name}' as taken at {now_str} today."
+
+@function_tool()
+async def next_medicine_due(
+    context: RunContext,  # type: ignore
+) -> str:
+    """
+    Show the next due medicine time for today (or tomorrow if none left today).
+    """
+    db = _load_db()
+    meds = db.get("medicines", [])
+    now = datetime.now()
+    today = date.today()
+    upcoming = []
+    for m in meds:
+        for t in m.get("times", []):
+            try:
+                hh, mm = map(int, t.split(":"))
+                dt = datetime.combine(today, datetime.min.time()).replace(hour=hh, minute=mm)
+                if dt >= now:
+                    upcoming.append((dt, m["name"], t))
+            except Exception:
+                continue
+    if not upcoming:
+        tomorrow = today + timedelta(days=1)
+        earliest = None
+        for m in meds:
+            for t in m.get("times", []):
+                try:
+                    hh, mm = map(int, t.split(":"))
+                    dt = datetime.combine(tomorrow, datetime.min.time()).replace(hour=hh, minute=mm)
+                    if earliest is None or dt < earliest[0]:
+                        earliest = (dt, m["name"], t)
+                except Exception:
+                    continue
+        if earliest:
+            when_str = earliest[0].strftime("%Y-%m-%d %H:%M")
+            return f"Next due: {earliest[1]} at {when_str}"
+        return "No upcoming medicines found."
+    upcoming.sort(key=lambda x: x[0])
+    first = upcoming[0]
+    when_str = first[0].strftime("%Y-%m-%d %H:%M")
+    return f"Next due: {first[1]} at {when_str}"

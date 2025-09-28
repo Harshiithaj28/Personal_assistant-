@@ -5,6 +5,6 @@ livekit-plugins-google
 livekit-plugins-noise-cancellation
 mem0ai
 duckduckgo-search
-langchain_community
+langchain-community
 requests
 python-dotenv
